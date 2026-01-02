@@ -21,7 +21,7 @@ from utils import TDBatchNorm, ZBiasAdder  # tdBN
 from fault_injection import build_fault_manager, get_fault_map
 from benchmarks import ECOCHead, install_softsnn, install_router_from_mask, autoroute_with_mask, attach_slot_activity_tracker, install_astro_auto, install_falvolt_auto, install_lifa_auto
 from algorithmic_fragmentation import batch_dynamic_fragments, batch_manual_fragments, agg_conf_logits, fragmentation_loss
-from learnable_fragmentation import GlobalMultiLineFrags, DynamicGlobalMultiLineFrags
+from learnable_fragmentation import GlobalMultiLineFrags, DynamicGlobalMultiLineFragsMerge, DynamicGlobalMultiLineFragsMoE
 from surrogate_encoders import SurrogatePoissonEncoder
 
 dtype = torch.float
@@ -38,7 +38,7 @@ parser = argparse.ArgumentParser()
 # Network parameters
 parser.add_argument("--train_batch_size", type=int, default=100)
 parser.add_argument("--test_batch_size", type=int, default=100)
-parser.add_argument("--data_path", type=str, default="propdata/CIFAR10")  # choose: propdata/CIFAR10 or propdata/CIFAR100
+parser.add_argument("--data_path", type=str, default="propdata/CIFAR100")  # choose: propdata/CIFAR10 or propdata/CIFAR100
 parser.add_argument("--num_steps", type=int, default=2)
 parser.add_argument("--num_epochs", type=int, default=50)
 parser.add_argument("--learning_rate", type=float, default=0.001)
@@ -58,7 +58,7 @@ parser.add_argument("--bias_apply_to_all", type=bool, default=True)
 parser.add_argument("--Fault", type=bool, default=True)
 parser.add_argument("--fault_type", default="stuck", choices=["stuck", "random", "connectivity"])
 parser.add_argument("--fault_dist", default="sporadic", choices=["sporadic", "clustered"])
-parser.add_argument("--fault_ratio", type=float, default=0.7)       # 10.79%, sa0 : sa1 = 1.75% : 9.04%
+parser.add_argument("--fault_ratio", type=float, default=0.5)       # 10.79%, sa0 : sa1 = 1.75% : 9.04%
 parser.add_argument("--noise_std", type=float, default=0.5)
 parser.add_argument("--fault_start_epoch", type=int, default=5)
 # Benchmarks
@@ -384,7 +384,7 @@ if Learnable_on:
         power_norm=power_cfg,
         balance_metric="mse",
         balance_weight=0.01,
-        sharpness=None,
+        sharpness=5.0,
         hard_forward=True,
         hard_eval=True,
         auto_init=True,
@@ -421,7 +421,7 @@ elif Dynamic_on:
         },
     }
 
-    dynamic_frags  = DynamicGlobalMultiLineFrags(
+    dynamic_frags  = DynamicGlobalMultiLineFragsMoE(
         H=32, W=32,
         candidates=(2, 4, 8),
         init_num_steps=num_steps,     # 시작 bias
@@ -548,7 +548,6 @@ for epoch in range(num_epochs):
                 spikes = encoder(input).float()
                 output.append(net(spikes))
             output = torch.stack(output, dim=0)
-            output = agg_conf_logits(output, tau=2.0, time_major=True)
 
         elif Dynamic_on:
             data = dynamic_frags(data, output_mode="mix", sample_steps=True)  # [B, Tmax, C, H, W]
@@ -559,7 +558,6 @@ for epoch in range(num_epochs):
                 spikes = encoder(input).float()
                 output.append(net(spikes))
             output = torch.stack(output, dim=0)
-            output = agg_conf_logits(output, tau=2.0, time_major=True)
 
         else:
             output = 0
@@ -575,9 +573,9 @@ for epoch in range(num_epochs):
         elif Frag_on:
             loss_val = fragmentation_loss(output, targets, mode="rmse")
         elif Learnable_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + learnable_frags.aux_loss()
+            loss_val = fragmentation_loss(output, targets, mode="rmse") + learnable_frags.aux_loss()
         elif Dynamic_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + dynamic_frags.aux_loss() + dynamic_frags.sep_loss()
+            loss_val = fragmentation_loss(output, targets, mode="rmse") + dynamic_frags.aux_loss() + dynamic_frags.sep_loss()
         elif Fault_on and Astro_on:
             loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + astro(epoch)
         elif Fault_on and Falvolt_on:
@@ -612,7 +610,7 @@ for epoch in range(num_epochs):
             net.apply(ParameterClipper())
 
             if counter % 50 == 0:
-                if Frag_on:
+                if Frag_on or Learnable_on or Dynamic_on:
                     output = agg_conf_logits(output, tau=2.0, time_major=True)
                 train_printer(output.view(train_batch_size, -1), targets)
 

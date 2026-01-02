@@ -22,7 +22,7 @@ from fault_injection import build_fault_manager, get_fault_map
 from benchmarks import ECOCHead, install_softsnn, install_router_from_mask, autoroute_with_mask, \
     attach_slot_activity_tracker, install_astro_auto, install_falvolt_auto, install_lifa_auto
 from algorithmic_fragmentation import batch_dynamic_fragments, batch_manual_fragments, agg_conf_logits, FragNorm
-from learnable_fragmentation import GlobalMultiLineFrags, DynamicGlobalMultiLineFrags
+from learnable_fragmentation import GlobalMultiLineFrags, DynamicGlobalMultiLineFragsMerge, DynamicGlobalMultiLineFragsMoE
 from surrogate_encoders import SurrogatePoissonEncoder
 
 from utils import ZBiasAdder
@@ -456,7 +456,7 @@ elif Dynamic_on:
         },
     }
 
-    dynamic_frags  = DynamicGlobalMultiLineFrags(
+    dynamic_frags  = DynamicGlobalMultiLineFragsMoE(
         H=28, W=28,
         candidates=(2, 4, 8),
         init_num_steps=num_steps,     # 시작 bias
@@ -591,6 +591,8 @@ for epoch in range(num_epochs):
         if ECOC_on:
             loss_val = ecoc.loss_ce(output, targets, metric="euclidean", temp=1.0, squared=True)
             # loss_val = torch.sqrt(ecoc.loss_mse(output, targets) + 1e-6)
+        elif Frag_on:
+            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6)
         elif Learnable_on:
             loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + learnable_frags.aux_loss()
         elif Dynamic_on:
@@ -604,6 +606,10 @@ for epoch in range(num_epochs):
         else:
             loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6)
             # loss_val = loss_fn(output, targets)
+
+        if Soft_on and epoch == 0:
+            bounder.capture_snapshot(net)
+            bounder.activate()
 
         # gradient calculation + weight update
         optimizer.zero_grad()
