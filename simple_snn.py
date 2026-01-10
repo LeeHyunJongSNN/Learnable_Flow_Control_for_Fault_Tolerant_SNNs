@@ -5,6 +5,8 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 from spikingjelly.activation_based import surrogate, neuron, functional, encoding
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 from sklearn.metrics import confusion_matrix
@@ -25,7 +27,7 @@ from algorithmic_fragmentation import batch_dynamic_fragments, batch_manual_frag
 from learnable_fragmentation import GlobalMultiLineFrags, DynamicGlobalMultiLineFragsMerge, DynamicGlobalMultiLineFragsMoE
 from surrogate_encoders import SurrogatePoissonEncoder
 
-from utils import ZBiasAdder
+from utils import ZBiasAdder, _choose_hw_autofold, seq1d_to_2d_autofold
 
 dtype = torch.float
 
@@ -57,8 +59,8 @@ parser.add_argument("--bias_start_epoch", type=float, default=5)
 parser.add_argument("--bias_target_layer", nargs='+', metavar="PATTERN", default=None)  # e.g., ['fc1']
 parser.add_argument("--bias_apply_to_all", type=bool, default=True)
 # Faults
-parser.add_argument("--Fault", type=bool, default=False)
-parser.add_argument("--fault_type", default="stuck", choices=["stuck", "random", "connectivity"])
+parser.add_argument("--Fault", type=bool, default=True)
+parser.add_argument("--fault_type", default="connectivity", choices=["stuck", "random", "connectivity"])
 parser.add_argument("--fault_dist", default="sporadic", choices=["sporadic", "clustered"])
 parser.add_argument("--fault_ratio", type=float, default=0.1)  # 10.79%, sa0 : sa1 = 1.75% : 9.04%
 parser.add_argument("--noise_std", type=float, default=0.5)
@@ -192,6 +194,26 @@ est_hist = []
 counter = 0
 epoch = 0
 
+# Choose 2D shape for fragmentation modules
+IMG_H, IMG_W = 28, 28
+SEQ_EFF_LEN = None
+
+if is_sequential and (Frag_on or Learnable_on or Dynamic_on):
+    raw_len = input_dim  # e.g., 128*9 for UCIHAR
+
+    # (optional) pixel budget: set 0 to disable
+    autofold_max_pixels = 0          # 예: 1024로 두면 32x32로 유도 가능
+    autofold_aspect_max = 4.0
+    min_side = 15                    # 너 fragmentation kernel_size가 15라서 기본값으로 추천
+
+    eff_len = min(raw_len, autofold_max_pixels) if autofold_max_pixels > 0 else raw_len
+    IMG_H, IMG_W = _choose_hw_autofold(eff_len, min_side=min_side, aspect_max=autofold_aspect_max)
+    SEQ_EFF_LEN = eff_len
+
+    # IMPORTANT: MLP input_dim must match flattened (H*W)
+    input_dim = IMG_H * IMG_W
+
+    print(f"[AutoFold] raw_len={raw_len}, eff_len={eff_len} -> (H,W)=({IMG_H},{IMG_W}), input_dim={input_dim}")
 
 # Define Network
 class Net(nn.Module):
@@ -413,12 +435,16 @@ if Learnable_on:
     }
 
     learnable_frags = GlobalMultiLineFrags(
-        H=28, W=28, num_steps=num_steps,
+        H=IMG_H, W=IMG_W, num_steps=num_steps,
         n_angles=180,
         importance_cfg=importance_cfg,
         power_norm=power_cfg,
         balance_metric="mse",
         balance_weight=0.01,
+        line_sep_weight=1e-3,
+        line_sep_cos_thr=0.995,
+        line_sep_offset_margin=0.03,
+        line_cross_weight=1e-3,
         sharpness=None,
         hard_forward=True,
         hard_eval=True,
@@ -457,7 +483,7 @@ elif Dynamic_on:
     }
 
     dynamic_frags  = DynamicGlobalMultiLineFragsMoE(
-        H=28, W=28,
+        H=IMG_H, W=IMG_W,
         candidates=(2, 4, 8),
         init_num_steps=num_steps,     # 시작 bias
         gumbel_tau=1.0,
@@ -480,6 +506,8 @@ elif Dynamic_on:
         line_sep_weight=1e-3,         # 분절선 중복 방지
         line_sep_cos_thr=0.995,
         line_sep_offset_margin=0.03,
+
+        line_cross_weight=1e-3,       # 선 교차 방지
 
         auto_init=True,               # 첫 배치로 입력-only 앵커 초기화
     ).to(device)
@@ -539,8 +567,10 @@ for epoch in range(num_epochs):
             dmin = data.amin(dim=(1, 2), keepdim=True)
             dmax = data.amax(dim=(1, 2), keepdim=True)
             data = (data - dmin) / (dmax - dmin + 1e-8)
-            if Frag_on:
-                data = data.view(batch_size, 1, 36, 32)
+
+            # convert sequential -> image-like [B,1,IMG_H,IMG_W] when using fragmentation
+            if Frag_on or Learnable_on or Dynamic_on:
+                data = seq1d_to_2d_autofold(data, H=IMG_H, W=IMG_W, out_len=SEQ_EFF_LEN, pad_value=0.0)
 
         target_onehot = nn.functional.one_hot(targets, num_classes).float()
 
@@ -591,12 +621,17 @@ for epoch in range(num_epochs):
         if ECOC_on:
             loss_val = ecoc.loss_ce(output, targets, metric="euclidean", temp=1.0, squared=True)
             # loss_val = torch.sqrt(ecoc.loss_mse(output, targets) + 1e-6)
+        elif Soft_on and epoch == 0:
+            bounder.capture_snapshot(net)
+            bounder.activate()
         elif Frag_on:
             loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6)
         elif Learnable_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + learnable_frags.aux_loss()
+            loss_val = (torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + learnable_frags.aux_loss()
+                        + learnable_frags.sep_loss() + learnable_frags.cross_loss())
         elif Dynamic_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + dynamic_frags.aux_loss() + dynamic_frags.sep_loss()
+            loss_val = (torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + dynamic_frags.aux_loss()
+                        + dynamic_frags.sep_loss() + dynamic_frags.cross_loss())
         elif Fault_on and Astro_on:
             loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + astro(epoch)
         elif Fault_on and Falvolt_on:
@@ -607,9 +642,6 @@ for epoch in range(num_epochs):
             loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6)
             # loss_val = loss_fn(output, targets)
 
-        if Soft_on and epoch == 0:
-            bounder.capture_snapshot(net)
-            bounder.activate()
 
         # gradient calculation + weight update
         optimizer.zero_grad()
@@ -679,8 +711,9 @@ with torch.no_grad():
             dmin = data.amin(dim=(1, 2), keepdim=True)
             dmax = data.amax(dim=(1, 2), keepdim=True)
             data = (data - dmin) / (dmax - dmin + 1e-8)
-            if Frag_on:
-                data = data.view(batch_size, 1, 36, 32)
+
+            if Frag_on or Learnable_on or Dynamic_on:
+                data = seq1d_to_2d_autofold(data, H=IMG_H, W=IMG_W, out_len=SEQ_EFF_LEN, pad_value=0.0)
 
         target_onehot = nn.functional.one_hot(targets, num_classes).float()
 

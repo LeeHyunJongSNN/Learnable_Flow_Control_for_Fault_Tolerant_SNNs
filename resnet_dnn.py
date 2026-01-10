@@ -606,6 +606,10 @@ if Learnable_on:
         power_norm=power_cfg,
         balance_metric="mse",
         balance_weight=0.01,
+        line_sep_weight=1e-3,
+        line_sep_cos_thr=0.995,
+        line_sep_offset_margin=0.03,
+        line_cross_weight=1e-3,
         sharpness=None,
         hard_forward=True,
         hard_eval=True,
@@ -665,6 +669,8 @@ elif Dynamic_on:
         line_sep_weight=1e-3,         # 분절선 중복 방지
         line_sep_cos_thr=0.995,
         line_sep_offset_margin=0.03,
+
+        line_cross_weight=1e-3,       # 선 교차 방지
 
         auto_init=True,               # 첫 배치로 입력-only 앵커 초기화
     ).to(device)
@@ -777,12 +783,17 @@ for epoch in range(num_epochs):
         if ECOC_on:
             loss_val = ecoc.loss_ce(output, targets, metric="euclidean", temp=1.0, squared=True)
             # loss_val = torch.sqrt(ecoc.loss_mse(output, targets) + 1e-6)
+        elif Soft_on and epoch == 0:
+            bounder.capture_snapshot(net)
+            bounder.activate()
         elif Frag_on:
             loss_val = fragmentation_loss(output, targets, mode="rmse")
         elif Learnable_on:
-            loss_val = fragmentation_loss(output, targets, mode="rmse") + learnable_frags.aux_loss()
+            loss_val = (fragmentation_loss(output, targets, mode="rmse") + learnable_frags.aux_loss() +
+                        learnable_frags.sep_loss() + learnable_frags.cross_loss())
         elif Dynamic_on:
-            loss_val = fragmentation_loss(output, targets, mode="rmse") + dynamic_frags.aux_loss() + dynamic_frags.sep_loss()
+            loss_val = (fragmentation_loss(output, targets, mode="rmse") + dynamic_frags.aux_loss() +
+                        dynamic_frags.sep_loss() + dynamic_frags.cross_loss())
         elif Fault_on and Astro_on:
             loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + astro(epoch)
         elif Fault_on and Falvolt_on:
@@ -792,6 +803,7 @@ for epoch in range(num_epochs):
         else:
             loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6)
             # loss_val = loss_fn(output, targets)
+
 
         optimizer.zero_grad()
         loss_val.backward()

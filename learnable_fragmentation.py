@@ -533,7 +533,6 @@ def _balance_penalty(p: torch.Tensor, metric: str, eps: float) -> torch.Tensor:
 
     raise ValueError(f"Unknown balance_metric={metric!r}")
 
-
 def line_nonoverlap_loss(
     params: MultiLineParams,
     *,
@@ -583,6 +582,53 @@ def line_nonoverlap_loss(
     loss = (p1 * p2 * mask).sum() / (mask.sum() + eps)
     return loss
 
+def line_crossing_loss(
+        params: MultiLineParams,
+        *,
+        H: int,
+        W: int,
+        box_margin: float = 0.0,
+        det_eps: float = 1e-6,
+        eps: float = 1e-12,
+) -> torch.Tensor:
+    """Penalize line pairs whose intersection lies inside the image box.
+
+    Lines are in centered pixel coords: a*x + b*y + c = 0.
+    The loss becomes large when the intersection point (x,y) falls inside the valid image region.
+    box_margin shrinks the valid box by (box_margin * diag) on all sides.
+    """
+    a, b, c = params.a, params.b, params.c
+    K = a.numel()
+    if K <= 1:
+        return a.sum() * 0.0
+
+    ai, aj = a.view(K, 1), a.view(1, K)
+    bi, bj = b.view(K, 1), b.view(1, K)
+    ci, cj = c.view(K, 1), c.view(1, K)
+
+    det = ai * bj - aj * bi
+    sgn = torch.sign(det)
+    sgn = torch.where(sgn == 0, torch.ones_like(sgn), sgn)
+    denom = det + sgn * float(det_eps)
+
+    # intersection:
+    x = (bi * cj - bj * ci) / denom
+    y = (aj * ci - ai * cj) / denom
+
+    diag = float(params.diag)
+    margin = float(box_margin) * diag
+    x_bound = max(((W - 1) / 2.0) - margin, 1e-6)
+    y_bound = max(((H - 1) / 2.0) - margin, 1e-6)
+
+    xb = a.new_tensor(float(x_bound))
+    yb = a.new_tensor(float(y_bound))
+
+    inside_x = F.relu(1.0 - x.abs() / (xb + eps))
+    inside_y = F.relu(1.0 - y.abs() / (yb + eps))
+    inside = inside_x * inside_y
+
+    mask = torch.ones((K, K), device=a.device, dtype=a.dtype) - torch.eye(K, device=a.device, dtype=a.dtype)
+    return (inside * mask).sum() / (mask.sum() + eps)
 
 # -----------------------------------------------------------------------------
 # Modules
@@ -617,13 +663,15 @@ class GlobalMultiLineFrags(nn.Module):
         overlap_iter: int = 2,
         # power
         power_norm: Optional[Dict[str, Any]] = None,
-        # aux balance
+        # aux losses
         balance_weight: float = 0.0,
         balance_metric: str = "mse",
-        # line separation
         line_sep_weight: float = 0.0,
         line_sep_cos_thr: float = 0.995,
         line_sep_offset_margin: float = 0.03,
+        line_cross_weight: float = 0.0,
+        line_cross_box_margin: float = 0.0,
+        line_cross_det_eps: float = 1e-6,
         # anchoring
         auto_init: bool = False,
         init_noise: float = 0.01,
@@ -651,10 +699,17 @@ class GlobalMultiLineFrags(nn.Module):
 
         self.balance_weight = float(balance_weight)
         self.balance_metric = _normalize_balance_metric(balance_metric)
+        self.last_balance_value: float = 0.0
 
         self.line_sep_weight = float(line_sep_weight)
         self.line_sep_cos_thr = float(line_sep_cos_thr)
         self.line_sep_offset_margin = float(line_sep_offset_margin)
+        self.last_sep_value: float = 0.0
+
+        self.line_cross_weight = float(line_cross_weight)
+        self.line_cross_box_margin = float(line_cross_box_margin)
+        self.line_cross_det_eps = float(line_cross_det_eps)
+        self.last_cross_value: float = 0.0
 
         self.auto_init = bool(auto_init)
         self.init_noise = float(init_noise)
@@ -673,10 +728,9 @@ class GlobalMultiLineFrags(nn.Module):
         # buffers for latest aux
         self.last_params: Optional[MultiLineParams] = None
         self._last_balance_loss: Optional[torch.Tensor] = None
-        self.last_balance_value: float = 0.0
         self.last_step_mass: Optional[torch.Tensor] = None
         self._last_sep_loss: Optional[torch.Tensor] = None
-        self.last_sep_value: float = 0.0
+        self._last_cross_loss: Optional[torch.Tensor] = None
 
     def _zero(self) -> torch.Tensor:
         return self.u.new_tensor(0.0)
@@ -789,6 +843,18 @@ class GlobalMultiLineFrags(nn.Module):
             self._last_sep_loss = None
             self.last_sep_value = 0.0
 
+        if self.line_cross_weight > 0.0:
+            cross = line_crossing_loss(
+                params, H=H, W=W,
+                box_margin=self.line_cross_box_margin,
+                det_eps=self.line_cross_det_eps,
+            )
+            self._last_cross_loss = cross
+            self.last_cross_value = float(cross.detach().cpu().item())
+        else:
+            self._last_cross_loss = None
+            self.last_cross_value = 0.0
+
         return frags
 
     def aux_loss(self, *, weight: Optional[float] = None) -> torch.Tensor:
@@ -803,8 +869,14 @@ class GlobalMultiLineFrags(nn.Module):
             return self._zero()
         return self._last_sep_loss * w
 
+    def cross_loss(self, *, weight: Optional[float] = None) -> torch.Tensor:
+        w = self.line_cross_weight if weight is None else float(weight)
+        if w == 0.0 or self._last_cross_loss is None:
+            return self._zero()
+        return self._last_cross_loss * w
 
-class DynamicGlobalMultiLineFrags(nn.Module):
+
+class DynamicGlobalMultiLineFragsMerge(nn.Module):
     """Dynamic num_steps (T) selection with Gumbel-Softmax + global multi-line params.
 
     We keep a single set of global line params for max_steps (Kmax=max_steps-1 lines).
@@ -848,6 +920,9 @@ class DynamicGlobalMultiLineFrags(nn.Module):
         line_sep_weight: float = 0.0,
         line_sep_cos_thr: float = 0.995,
         line_sep_offset_margin: float = 0.03,
+        line_cross_weight: float = 0.0,
+        line_cross_box_margin: float = 0.0,
+        line_cross_det_eps: float = 1e-6,
         # anchoring
         auto_init: bool = False,
         init_noise: float = 0.01,
@@ -897,6 +972,10 @@ class DynamicGlobalMultiLineFrags(nn.Module):
         self.line_sep_cos_thr = float(line_sep_cos_thr)
         self.line_sep_offset_margin = float(line_sep_offset_margin)
 
+        self.line_cross_weight = float(line_cross_weight)
+        self.line_cross_box_margin = float(line_cross_box_margin)
+        self.line_cross_det_eps = float(line_cross_det_eps)
+
         self.auto_init = bool(auto_init)
         self.init_noise = float(init_noise)
         self.register_buffer("_did_init", torch.zeros((), dtype=torch.bool))
@@ -924,6 +1003,7 @@ class DynamicGlobalMultiLineFrags(nn.Module):
         self.last_params: Optional[MultiLineParams] = None
         self._last_balance_loss: Optional[torch.Tensor] = None
         self._last_sep_loss: Optional[torch.Tensor] = None
+        self._last_cross_loss: Optional[torch.Tensor] = None
 
     def _zero(self) -> torch.Tensor:
         return self.u.new_tensor(0.0)
@@ -1080,6 +1160,13 @@ class DynamicGlobalMultiLineFrags(nn.Module):
                 offset_margin=self.line_sep_offset_margin,
             )
 
+        if self.line_cross_weight > 0.0:
+            self._last_cross_loss = line_crossing_loss(
+                self.last_params, H=H, W=W,
+                box_margin=self.line_cross_box_margin,
+                det_eps=self.line_cross_det_eps,
+            )
+
         mode = str(output_mode).strip().lower()
         if mode == "all":
             # return full set for expected loss outside
@@ -1115,6 +1202,427 @@ class DynamicGlobalMultiLineFrags(nn.Module):
             return self._zero()
         return self._last_sep_loss * w
 
+    def cross_loss(self, *, weight: Optional[float] = None) -> torch.Tensor:
+        w = self.line_cross_weight if weight is None else float(weight)
+        if w == 0.0 or self._last_cross_loss is None:
+            return self._zero()
+        return self._last_cross_loss * w
+
+
+class DynamicGlobalMultiLineFragsMoE(nn.Module):
+    """MoE-style dynamic step selection with per-candidate learnable multi-line parameters.
+
+    기존 DynamicGlobalMultiLineFrags 대비 변경점:
+      - candidates의 각 T(=num_steps)마다 서로 다른 분절선 파라미터(u,v,r)를 별도로 학습 (Mixture-of-Experts 느낌)
+      - 더 이상 "max_steps에서 mask를 만들고 작은 T는 merge로 얻는" 제약이 필요 없음
+        (즉 candidates가 max_steps를 나눌 필요가 없음)
+
+    Forward options (기존과 동일):
+      - output_mode="mix": [B, max_steps, C, H, W] 형태로 candidate들을 soft weight(p)로 mix
+      - output_mode="all": (dict[T]->frags_T, p, y_hard, T_sel)
+      - output_mode="selected": [B, T_sel, C, H, W]
+    """
+
+    def __init__(
+            self,
+            *,
+            H: int,
+            W: int,
+            candidates: Sequence[int] = (2, 4, 8, 16),
+            init_num_steps: int = 8,
+            n_angles: int = 180,
+            importance_cfg: Optional[Dict[str, Any]] = None,
+            # gumbel softmax
+            gumbel_tau: float = 1.0,
+            gumbel_hard: bool = True,
+            warmup_iters: int = 0,
+            # mask behavior
+            sharpness: Optional[float] = None,
+            hard_forward: bool = True,
+            hard_eval: bool = True,
+            # overlap
+            overlap: bool = False,
+            kernel_size: int = 11,
+            overlap_iter: int = 2,
+            # power
+            power_norm: Optional[Dict[str, Any]] = None,
+            # aux losses
+            balance_weight: float = 0.0,
+            balance_metric: str = "mse",
+            line_sep_weight: float = 0.0,
+            line_sep_cos_thr: float = 0.995,
+            line_sep_offset_margin: float = 0.03,
+            line_cross_weight: float = 0.0,
+            line_cross_box_margin: float = 0.0,
+            line_cross_det_eps: float = 1e-6,
+            # anchoring
+            auto_init: bool = False,
+            init_noise: float = 0.01,
+            init_logit_bias: float = 4.0,
+    ) -> None:
+        super().__init__()
+
+        self.H = int(H)
+        self.W = int(W)
+
+        cand = tuple(sorted({int(x) for x in candidates}))
+        if any(t < 2 for t in cand):
+            raise ValueError("All candidates must be >= 2")
+        self.candidates = cand
+
+        if int(init_num_steps) not in self.candidates:
+            raise ValueError(f"init_num_steps={init_num_steps} must be in candidates={self.candidates}")
+
+        self.max_steps = max(self.candidates)
+
+        self.n_angles = int(n_angles)
+        self.importance_cfg = importance_cfg
+
+        self.gumbel_tau = float(gumbel_tau)
+        self.gumbel_hard = bool(gumbel_hard)
+        self.warmup_iters = int(warmup_iters)
+
+        self.sharpness = sharpness
+        self.hard_forward = bool(hard_forward)
+        self.hard_eval = bool(hard_eval)
+
+        self.overlap = bool(overlap)
+        self.kernel_size = int(kernel_size)
+        self.overlap_iter = int(overlap_iter)
+
+        self.power_norm = power_norm
+
+        self.balance_weight = float(balance_weight)
+        self.balance_metric = _normalize_balance_metric(balance_metric)
+
+        self.line_sep_weight = float(line_sep_weight)
+        self.line_sep_cos_thr = float(line_sep_cos_thr)
+        self.line_sep_offset_margin = float(line_sep_offset_margin)
+
+        self.line_cross_weight = float(line_cross_weight)
+        self.line_cross_box_margin = float(line_cross_box_margin)
+        self.line_cross_det_eps = float(line_cross_det_eps)
+
+        self.auto_init = bool(auto_init)
+        self.init_noise = float(init_noise)
+        self.register_buffer("_did_init", torch.zeros((), dtype=torch.bool))
+        self.register_buffer("_iter", torch.zeros((), dtype=torch.long))
+
+        # diag (bounding for c = diag*tanh(r))
+        _xx, _yy, diag = _centered_meshgrid(self.H, self.W, device=torch.device("cpu"), dtype=torch.float32)
+        self.diag = float(diag)
+
+        # ------------------------------------------------------------
+        # MoE experts: per-candidate line params
+        #   for each T: K=T-1 lines, each line has (u_k, v_k, r_k)
+        # ------------------------------------------------------------
+        self.u = nn.ParameterDict()
+        self.v = nn.ParameterDict()
+        self.r = nn.ParameterDict()
+        for T in self.candidates:
+            K = int(T) - 1
+            self.u[str(T)] = nn.Parameter(torch.randn(K) * 0.02)
+            self.v[str(T)] = nn.Parameter(torch.randn(K) * 0.02)
+            self.r[str(T)] = nn.Parameter(torch.zeros(K))
+
+        # step logits (categorical over candidates)
+        self.step_logits = nn.Parameter(torch.zeros(len(self.candidates), dtype=torch.float32))
+        with torch.no_grad():
+            init_i = self.candidates.index(int(init_num_steps))
+            self.step_logits[init_i] = float(init_logit_bias)
+
+        # logging
+        self.current_num_steps: int = int(init_num_steps)
+        self.last_p: Optional[torch.Tensor] = None
+        self.last_y: Optional[torch.Tensor] = None
+        self.last_params: Optional[MultiLineParams] = None
+        self._last_balance_loss: Optional[torch.Tensor] = None
+        self._last_sep_loss: Optional[torch.Tensor] = None
+        self._last_cross_loss: Optional[torch.Tensor] = None
+
+    def _zero(self) -> torch.Tensor:
+        return self.step_logits.new_tensor(0.0)
+
+    # ----------------------------
+    # Anchoring init (input-only)
+    # ----------------------------
+    @torch.no_grad()
+    def init_from_batch(self, images_bchw: torch.Tensor) -> None:
+        """Input-only anchor init for *each* candidate expert.
+
+        - 첫 배치 기반으로 best angle + equal-mass(또는 equal-width) cut 위치를 잡고
+        - 각 candidate의 (u,v,r)를 해당 anchor로 초기화
+        """
+        if images_bchw.dim() != 4:
+            raise ValueError(f"images must be [B,C,H,W], got {tuple(images_bchw.shape)}")
+        B, C, H, W = images_bchw.shape
+        if H != self.H or W != self.W:
+            raise ValueError(f"Expected H,W=({self.H},{self.W}), got ({H},{W})")
+
+        device, dtype = images_bchw.device, images_bchw.dtype
+
+        # weight map once
+        _, w_avg, parsed = batch_weight_maps(images_bchw, importance_cfg=self.importance_cfg)
+        eps = float(parsed["eps"])
+
+        # best angle once
+        best_theta = choose_best_angle(w_avg, n_angles=int(self.n_angles))
+        theta = math.radians(float(best_theta))
+        a0 = float(math.sin(theta))
+        b0 = float(math.cos(theta))
+
+        # projected coordinate s = a*x + b*y
+        xx, yy, _diag = _centered_meshgrid(H, W, device=device, dtype=dtype)
+        s = a0 * xx + b0 * yy  # [H,W]
+
+        cut_scheme = parsed["cut_scheme"]
+
+        if cut_scheme == "equal_width":
+            s_min = float(s.min().item())
+            s_max = float(s.max().item())
+            s_sorted, cw, total = None, None, None
+        else:
+            # equal_mass: sort once
+            s_flat = s.reshape(-1)
+            w_flat = w_avg.reshape(-1).clamp_min(0.0)
+            sort_idx = torch.argsort(s_flat)
+            s_sorted = s_flat[sort_idx]
+            w_sorted = w_flat[sort_idx]
+            cw = torch.cumsum(w_sorted, dim=0)
+            total = cw[-1].clamp_min(eps)
+
+        diag_t = images_bchw.new_tensor(float(self.diag))
+        u0 = images_bchw.new_tensor(a0)
+        v0 = images_bchw.new_tensor(b0)
+
+        for T in self.candidates:
+            K = int(T) - 1
+
+            # init direction
+            self.u[str(T)].copy_(u0.expand(K))
+            self.v[str(T)].copy_(v0.expand(K))
+
+            # small symmetry-breaking noise
+            if self.init_noise > 0:
+                self.u[str(T)].add_(self.init_noise * torch.randn_like(self.u[str(T)]))
+                self.v[str(T)].add_(self.init_noise * torch.randn_like(self.v[str(T)]))
+
+            # init offsets
+            if cut_scheme == "equal_width":
+                t = torch.linspace(s_min, s_max, steps=int(T) + 1, device=device, dtype=dtype)[1:-1]  # [K]
+            else:
+                qs = torch.linspace(0.0, 1.0, steps=int(T) + 1, device=device, dtype=dtype)[1:-1]  # [K]
+                targets = qs * total
+                idx = torch.searchsorted(cw, targets).clamp(0, s_sorted.numel() - 1)
+                t = s_sorted[idx]
+
+            # c = -t,  c_raw = atanh(c/diag)
+            z = (-t / diag_t).clamp(-0.999, 0.999)
+            c_raw = _atanh_safe(z)
+            self.r[str(T)].copy_(c_raw)
+
+        self._did_init.fill_(True)
+
+    def _maybe_auto_init(self, images_bchw: torch.Tensor) -> None:
+        if self.auto_init and (not bool(self._did_init.item())):
+            self.init_from_batch(images_bchw)
+
+    # ----------------------------
+    # Step selection (Gumbel-Softmax)
+    # ----------------------------
+    def _select_distribution(self, *, sample: bool) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Return (p_soft, y_hard_or_soft, T_sel)."""
+        if self.training:
+            self._iter += 1
+
+        # warmup: keep current choice fixed
+        if self.training and self.warmup_iters > 0 and int(self._iter.item()) <= self.warmup_iters:
+            idx = torch.tensor(self.candidates.index(self.current_num_steps), device=self.step_logits.device)
+            y = F.one_hot(idx, num_classes=len(self.candidates)).to(self.step_logits.dtype)
+            return y, y, int(self.current_num_steps)
+
+        if self.training and sample:
+            p = F.gumbel_softmax(self.step_logits, tau=self.gumbel_tau, hard=False, dim=0)
+            if self.gumbel_hard:
+                idx = torch.argmax(p, dim=0)
+                y = F.one_hot(idx, num_classes=len(self.candidates)).to(p.dtype)
+                # ST: forward is hard, backward follows p
+                y = y - p.detach() + p
+            else:
+                y = p
+            idx_i = int(torch.argmax(p).item())
+            T_sel = int(self.candidates[idx_i])
+            return p, y, T_sel
+
+        # eval or deterministic
+        idx_i = int(torch.argmax(self.step_logits).item())
+        T_sel = int(self.candidates[idx_i])
+        y = F.one_hot(
+            torch.tensor(idx_i, device=self.step_logits.device),
+            num_classes=len(self.candidates),
+        ).to(self.step_logits.dtype)
+        return y, y, T_sel
+
+    @torch.no_grad()
+    def best_num_steps(self) -> int:
+        idx = int(torch.argmax(self.step_logits).item())
+        return int(self.candidates[idx])
+
+    # ----------------------------
+    # Mix helper: upsample T -> max_steps
+    # ----------------------------
+    def _upsample_to_max_steps(self, frags: torch.Tensor, Tmax: int) -> torch.Tensor:
+        """Nearest-neighbor upsample along time dimension to length Tmax.
+
+        candidates가 Tmax를 나누지 않아도 되도록, index mapping으로 time-length를 맞춘다.
+        """
+        B, T, C, H, W = frags.shape
+        if T == Tmax:
+            return frags
+        device = frags.device
+        idx = (torch.arange(Tmax, device=device) * T) // Tmax  # [Tmax] in [0, T-1]
+        return frags.index_select(dim=1, index=idx)
+
+    # ----------------------------
+    # Forward
+    # ----------------------------
+    def forward(
+            self,
+            images_bchw: torch.Tensor,
+            *,
+            output_mode: str = "mix",
+            sample_steps: bool = True,
+    ):
+        if images_bchw.dim() != 4:
+            raise ValueError(f"images must be [B,C,H,W], got {tuple(images_bchw.shape)}")
+        B, C, H, W = images_bchw.shape
+        if H != self.H or W != self.W:
+            raise ValueError(f"Expected H,W=({self.H},{self.W}), got ({H},{W})")
+
+        self._maybe_auto_init(images_bchw)
+
+        use_hard = self.hard_forward if self.training else self.hard_eval
+
+        frags_by_T: Dict[int, torch.Tensor] = {}
+        masks_by_T_soft: Dict[int, torch.Tensor] = {}
+        params_by_T: Dict[int, MultiLineParams] = {}
+
+        # --- build each expert's fragmentation ---
+        for T in self.candidates:
+            raw = MultiLineRawParams(u=self.u[str(T)], v=self.v[str(T)], r=self.r[str(T)], diag=self.diag)
+            params = raw.to_params()
+            params_by_T[int(T)] = params
+
+            masks_soft = multiline_masks(
+                H, W, params,
+                sharpness=self.sharpness,
+                straight_through=False,
+                overlap=self.overlap,
+                kernel_size=self.kernel_size,
+                overlap_iter=self.overlap_iter,
+            )
+            masks_by_T_soft[int(T)] = masks_soft
+
+            if use_hard:
+                # forward: hard mask, backward: soft mask (ST)
+                masks_use = multiline_masks(
+                    H, W, params,
+                    sharpness=self.sharpness,
+                    straight_through=True,
+                    overlap=self.overlap,
+                    kernel_size=self.kernel_size,
+                    overlap_iter=self.overlap_iter,
+                )
+            else:
+                masks_use = masks_soft
+
+            frags_T = images_bchw.unsqueeze(1) * masks_use.unsqueeze(0).unsqueeze(2)  # [B,T,C,H,W]
+
+            if self.power_norm is not None:
+                mask_bt1 = masks_use.unsqueeze(0).unsqueeze(2).expand(B, -1, -1, -1, -1)
+                frags_T, _gain = power_normalize_frags(frags_T, mask=mask_bt1, **self.power_norm)
+
+            frags_by_T[int(T)] = frags_T
+
+        # --- select distribution over candidates ---
+        p, y, T_sel = self._select_distribution(sample=sample_steps)
+        self.last_p = p
+        self.last_y = y
+        self.current_num_steps = int(T_sel)
+        self.last_params = params_by_T[int(T_sel)]
+
+        # --- aux losses (기존과 동일하게 "선택된 T" 기준으로 계산) ---
+        self._last_balance_loss = None
+        self._last_sep_loss = None
+
+        if self.balance_weight > 0.0:
+            _w, w_avg, parsed = batch_weight_maps(images_bchw, importance_cfg=self.importance_cfg)
+            eps = float(parsed["eps"])
+            w = w_avg.to(
+                device=masks_by_T_soft[int(T_sel)].device,
+                dtype=masks_by_T_soft[int(T_sel)].dtype,
+            )
+            masks_sel = masks_by_T_soft[int(T_sel)]
+            step_mass = (masks_sel * w.unsqueeze(0)).sum(dim=(1, 2))
+            total = step_mass.sum()
+            if total.detach().abs().item() <= eps:
+                self._last_balance_loss = masks_sel.sum() * 0.0
+            else:
+                p_step = step_mass / (total + eps)
+                self._last_balance_loss = _balance_penalty(p_step, metric=self.balance_metric, eps=eps)
+
+        if self.line_sep_weight > 0.0:
+            self._last_sep_loss = line_nonoverlap_loss(
+                self.last_params,
+                cos_thr=self.line_sep_cos_thr,
+                offset_margin=self.line_sep_offset_margin,
+            )
+
+        if self.line_cross_weight > 0.0:
+            self._last_cross_loss = line_crossing_loss(
+                self.last_params, H=H, W=W,
+                box_margin=self.line_cross_box_margin,
+                det_eps=self.line_cross_det_eps,
+            )
+
+        mode = str(output_mode).strip().lower()
+        if mode == "all":
+            return frags_by_T, p, y, int(T_sel)
+
+        if mode == "selected":
+            return frags_by_T[int(T_sel)]
+
+        if mode == "mix":
+            Tmax = self.max_steps
+            out = None
+            for i, T in enumerate(self.candidates):
+                fr = frags_by_T[int(T)]                    # [B,T,C,H,W]
+                fr_rep = self._upsample_to_max_steps(fr, Tmax)  # [B,Tmax,C,H,W]
+                w_i = p[i] if p is not None else y[i]
+                fr_rep = fr_rep * w_i.view(1, 1, 1, 1, 1)
+                out = fr_rep if out is None else (out + fr_rep)
+            return out
+
+        raise ValueError("output_mode must be 'mix' | 'all' | 'selected'")
+
+    def aux_loss(self, *, weight: Optional[float] = None) -> torch.Tensor:
+        w = self.balance_weight if weight is None else float(weight)
+        if w == 0.0 or self._last_balance_loss is None:
+            return self._zero()
+        return self._last_balance_loss * w
+
+    def sep_loss(self, *, weight: Optional[float] = None) -> torch.Tensor:
+        w = self.line_sep_weight if weight is None else float(weight)
+        if w == 0.0 or self._last_sep_loss is None:
+            return self._zero()
+        return self._last_sep_loss * w
+
+    def cross_loss(self, *, weight: Optional[float] = None) -> torch.Tensor:
+        w = self.line_cross_weight if weight is None else float(weight)
+        if w == 0.0 or self._last_cross_loss is None:
+            return self._zero()
+        return self._last_cross_loss * w
+
 
 __all__ = [
     "batch_weight_maps",
@@ -1125,5 +1633,6 @@ __all__ = [
     "apply_multiline_fragmentation",
     "line_nonoverlap_loss",
     "GlobalMultiLineFrags",
-    "DynamicGlobalMultiLineFrags",
+    "DynamicGlobalMultiLineFragsMerge",
+    "DynamicGlobalMultiLineFragsMoE",
 ]

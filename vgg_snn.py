@@ -38,7 +38,7 @@ parser = argparse.ArgumentParser()
 # Network parameters
 parser.add_argument("--train_batch_size", type=int, default=100)
 parser.add_argument("--test_batch_size", type=int, default=100)
-parser.add_argument("--data_path", type=str, default="propdata/CIFAR100")  # choose: propdata/CIFAR10 or propdata/CIFAR100
+parser.add_argument("--data_path", type=str, default="propdata/CIFAR10")  # choose: propdata/CIFAR10 or propdata/CIFAR100
 parser.add_argument("--num_steps", type=int, default=2)
 parser.add_argument("--num_epochs", type=int, default=50)
 parser.add_argument("--learning_rate", type=float, default=0.001)
@@ -56,9 +56,9 @@ parser.add_argument("--bias_target_layer", nargs='+', metavar="PATTERN", default
 parser.add_argument("--bias_apply_to_all", type=bool, default=True)
 # Faults
 parser.add_argument("--Fault", type=bool, default=True)
-parser.add_argument("--fault_type", default="stuck", choices=["stuck", "random", "connectivity"])
+parser.add_argument("--fault_type", default="connectivity", choices=["stuck", "random", "connectivity"])
 parser.add_argument("--fault_dist", default="sporadic", choices=["sporadic", "clustered"])
-parser.add_argument("--fault_ratio", type=float, default=0.5)       # 10.79%, sa0 : sa1 = 1.75% : 9.04%
+parser.add_argument("--fault_ratio", type=float, default=0.2)       # 10.79%, sa0 : sa1 = 1.75% : 9.04%
 parser.add_argument("--noise_std", type=float, default=0.5)
 parser.add_argument("--fault_start_epoch", type=int, default=5)
 # Benchmarks
@@ -384,6 +384,10 @@ if Learnable_on:
         power_norm=power_cfg,
         balance_metric="mse",
         balance_weight=0.01,
+        line_sep_weight=1e-3,
+        line_sep_cos_thr=0.995,
+        line_sep_offset_margin=0.03,
+        line_cross_weight=1e-3,
         sharpness=5.0,
         hard_forward=True,
         hard_eval=True,
@@ -445,6 +449,8 @@ elif Dynamic_on:
         line_sep_weight=1e-3,         # 분절선 중복 방지
         line_sep_cos_thr=0.995,
         line_sep_offset_margin=0.03,
+
+        line_cross_weight=1e-3,       # 선 교차 방지
 
         auto_init=True,               # 첫 배치로 입력-only 앵커 초기화
     ).to(device)
@@ -570,12 +576,17 @@ for epoch in range(num_epochs):
         if ECOC_on:
             loss_val = ecoc.loss_ce(output, targets, metric="euclidean", temp=1.0, squared=True)
             # loss_val = torch.sqrt(ecoc.loss_mse(output, targets) + 1e-6)
+        elif Soft_on and epoch == 0:
+            bounder.capture_snapshot(net)
+            bounder.activate()
         elif Frag_on:
             loss_val = fragmentation_loss(output, targets, mode="rmse")
         elif Learnable_on:
-            loss_val = fragmentation_loss(output, targets, mode="rmse") + learnable_frags.aux_loss()
+            loss_val = (fragmentation_loss(output, targets, mode="rmse") + learnable_frags.aux_loss() +
+                        learnable_frags.sep_loss() + learnable_frags.cross_loss())
         elif Dynamic_on:
-            loss_val = fragmentation_loss(output, targets, mode="rmse") + dynamic_frags.aux_loss() + dynamic_frags.sep_loss()
+            loss_val = (fragmentation_loss(output, targets, mode="rmse") + dynamic_frags.aux_loss() +
+                        dynamic_frags.sep_loss() + dynamic_frags.cross_loss())
         elif Fault_on and Astro_on:
             loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + astro(epoch)
         elif Fault_on and Falvolt_on:
@@ -586,9 +597,6 @@ for epoch in range(num_epochs):
             loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6)
             # loss_val = loss_fn(output, targets)
 
-        if Soft_on and epoch == 0:
-            bounder.capture_snapshot(net)
-            bounder.activate()
 
         optimizer.zero_grad()
         loss_val.backward()
