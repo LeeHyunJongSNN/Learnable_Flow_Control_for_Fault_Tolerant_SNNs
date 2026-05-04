@@ -69,9 +69,9 @@ parser.add_argument("--Astrocyte", type=str2bool, default=False)
 parser.add_argument("--Falvolt", type=str2bool, default=False)
 parser.add_argument("--LIFA", type=str2bool, default=False)
 # Proposed
-parser.add_argument("--Frag", type=str2bool, default=False)
-parser.add_argument("--Learnable", type=str2bool, default=False)
-parser.add_argument("--Dynamic", type=str2bool, default=True)
+parser.add_argument("--Frag", type=str2bool, default=False)      # Fragmentation function
+parser.add_argument("--Learnable", type=str2bool, default=False) # Learnable division line
+parser.add_argument("--Dynamic", type=str2bool, default=False)   # Dynamically changing the number of fragments
 # ETC
 parser.add_argument("--gpu_num", type=int, default=0)
 parser.add_argument("--plot", type=bool, default=False)
@@ -217,9 +217,9 @@ class Net(nn.Module):
         super().__init__()
 
         # Initialize layers
-        if Frag_on or Learnable_on or Dynamic_on:
-            self.fn = FragNorm(num_features=input_dim, time_aggregate=False, affine=True,
-                               track_running_stats=False, momentum=0.1, eps=1e-5)
+        # if Frag_on or Learnable_on or Dynamic_on:
+        #     self.fn = FragNorm(num_features=input_dim, time_aggregate=False, affine=True,
+        #                        track_running_stats=False, momentum=0.1, eps=1e-5)
         self.fc1 = nn.Linear(input_dim, 1024, bias=bias)
         self.lif1 = nn.ReLU()
         self.fc2 = nn.Linear(1024, 512, bias=bias)
@@ -227,11 +227,11 @@ class Net(nn.Module):
         self.fc3 = nn.Linear(512, 128, bias=bias)
         self.lif3 = nn.ReLU()
         self.fc4 = nn.Linear(128, num_classes, bias=bias)
-        self.lif4 = nn.ReLU()
+        # self.lif4 = nn.ReLU()
 
     def forward(self, x):
-        if Frag_on or Learnable_on or Dynamic_on:
-            x = self.fn(x)
+        # if Frag_on or Learnable_on or Dynamic_on:
+        #     x = self.fn(x)
         x = self.fc1(x)
         x = self.lif1(x)
         x = self.fc2(x)
@@ -239,7 +239,7 @@ class Net(nn.Module):
         x = self.fc3(x)
         x = self.lif3(x)
         x = self.fc4(x)
-        x = self.lif4(x)
+        # x = self.lif4(x)
 
         return x
 
@@ -404,8 +404,8 @@ def _get_attr_by_path(root, dotted):
 # Define optimizer, scheduler, and loss function
 optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.75)
-loss_fn = nn.MSELoss()
-# loss_fn = nn.CrossEntropyLoss()
+# loss_fn = nn.MSELoss()
+loss_fn = nn.CrossEntropyLoss()
 
 if Learnable_on:
     importance_cfg = {
@@ -566,7 +566,6 @@ for epoch in range(num_epochs):
         target_onehot = nn.functional.one_hot(targets, num_classes).float()
 
         # inner training loop (spike timing)
-        logits_t = None
         if Frag_on:
             # data = batch_manual_fragments(data, num_steps, overlap=True, direction="horizontal",
             #                               kernel_size=15, overlap_iter=3, power_norm=power_cfg)
@@ -612,21 +611,21 @@ for epoch in range(num_epochs):
             bounder.capture_snapshot(net)
             bounder.activate()
         elif Frag_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6)
+            loss_val = loss_fn(output, target_onehot)
         elif Learnable_on:
-            loss_val = (torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + learnable_frags.aux_loss() +
+            loss_val = (loss_fn(output, target_onehot) + learnable_frags.aux_loss() +
                         learnable_frags.sep_loss() + learnable_frags.cross_loss())
         elif Dynamic_on:
-            loss_val = (torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + dynamic_frags.aux_loss() +
+            loss_val = (loss_fn(output, target_onehot) + dynamic_frags.aux_loss() +
                         dynamic_frags.sep_loss() + dynamic_frags.cross_loss())
         elif Fault_on and Astro_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + astro(epoch)
+            loss_val = loss_fn(output, target_onehot) + astro(epoch)
         elif Fault_on and Falvolt_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + falvolt(epoch)
+            loss_val = loss_fn(output, target_onehot) + falvolt(epoch)
         elif Fault_on and LIFA_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + lifa(epoch)
+            loss_val = loss_fn(output, target_onehot) + lifa(epoch)
         else:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6)
+            loss_val = loss_fn(output, target_onehot)
             # loss_val = loss_fn(output, targets)
 
         # gradient calculation + weight update

@@ -57,7 +57,7 @@ parser.add_argument("--use_imagenet", type=str, default="false")  # true/false
 parser.add_argument("--num_steps", type=int, default=2)
 parser.add_argument("--num_epochs", type=int, default=50)
 parser.add_argument("--learning_rate", type=float, default=0.01)
-parser.add_argument("--limit", type=float, default=1.0)             # it's the boundary of synaptic weights!
+parser.add_argument("--limit", type=float, default=100.0)             # it's the boundary of synaptic weights!
 parser.add_argument("--bias", type=bool, default=False)
 parser.add_argument("--resnet_depth", type=int, choices=[18, 34], default=18)
 # Z Bias
@@ -84,10 +84,9 @@ parser.add_argument("--Astrocyte", type=str2bool, default=False)
 parser.add_argument("--Falvolt", type=str2bool, default=False)
 parser.add_argument("--LIFA", type=str2bool, default=False)
 # Proposed
-parser.add_argument("--Frag", type=str2bool, default=False)
-parser.add_argument("--Learnable", type=str2bool, default=False)
-parser.add_argument("--Dynamic", type=str2bool, default=True)
-
+parser.add_argument("--Frag", type=str2bool, default=False)      # Fragmentation function
+parser.add_argument("--Learnable", type=str2bool, default=False) # Learnable division line
+parser.add_argument("--Dynamic", type=str2bool, default=False)   # Dynamically changing the number of fragments
 # ETC
 parser.add_argument("--gpu_num", type=int, default=0)
 parser.add_argument("--plot", type=bool, default=False)
@@ -188,8 +187,8 @@ else:
     in_ch, H, W, num_classes = meta["in_ch"], meta["H"], meta["W"], meta["num_classes"]
 
 # ===== loss/opt/scheduler/encoder =====
-loss_fn = nn.MSELoss()
-# loss_fn = nn.CrossEntropyLoss()
+# loss_fn = nn.MSELoss()
+loss_fn = nn.CrossEntropyLoss()
 
 # ===== ResNet-SNN for CIFAR (20/32/44) =====
 
@@ -787,21 +786,21 @@ for epoch in range(num_epochs):
             bounder.capture_snapshot(net)
             bounder.activate()
         elif Frag_on:
-            loss_val = fragmentation_loss(output, targets, mode="rmse")
+            loss_val = fragmentation_loss(output, targets, mode="ce")
         elif Learnable_on:
-            loss_val = (fragmentation_loss(output, targets, mode="rmse") + learnable_frags.aux_loss() +
+            loss_val = (fragmentation_loss(output, targets, mode="ce") + learnable_frags.aux_loss() +
                         learnable_frags.sep_loss() + learnable_frags.cross_loss())
         elif Dynamic_on:
-            loss_val = (fragmentation_loss(output, targets, mode="rmse") + dynamic_frags.aux_loss() +
+            loss_val = (fragmentation_loss(output, targets, mode="ce") + dynamic_frags.aux_loss() +
                         dynamic_frags.sep_loss() + dynamic_frags.cross_loss())
         elif Fault_on and Astro_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + astro(epoch)
+            loss_val = loss_fn(output, target_onehot) + astro(epoch)
         elif Fault_on and Falvolt_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + falvolt(epoch)
+            loss_val = loss_fn(output, target_onehot) + falvolt(epoch)
         elif Fault_on and LIFA_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + lifa(epoch)
+            loss_val = loss_fn(output, target_onehot) + lifa(epoch)
         else:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6)
+            loss_val = loss_fn(output, target_onehot)
             # loss_val = loss_fn(output, targets)
 
 

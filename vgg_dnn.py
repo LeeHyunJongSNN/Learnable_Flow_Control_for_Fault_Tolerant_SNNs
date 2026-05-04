@@ -40,7 +40,7 @@ parser.add_argument("--data_path", type=str, default="propdata/CIFAR10")  # choo
 parser.add_argument("--num_steps", type=int, default=2)
 parser.add_argument("--num_epochs", type=int, default=50)
 parser.add_argument("--learning_rate", type=float, default=0.001)
-parser.add_argument("--limit", type=float, default=1.0)             # it's the boundary of synaptic weights!
+parser.add_argument("--limit", type=float, default=100.0)             # it's the boundary of synaptic weights!
 parser.add_argument("--bias", type=bool, default=False)
 parser.add_argument("--vgg_depth", type=int, choices=[7, 11, 15], default=7)
 # Z Bias
@@ -53,10 +53,10 @@ parser.add_argument("--bias_start_epoch", type=float, default=5)
 parser.add_argument("--bias_target_layer", nargs='+', metavar="PATTERN", default=None)  # e.g., ['fc1']
 parser.add_argument("--bias_apply_to_all", type=bool, default=True)
 # Faults
-parser.add_argument("--Fault", type=bool, default=True)
+parser.add_argument("--Fault", type=bool, default=False)
 parser.add_argument("--fault_type", default="stuck", choices=["stuck", "random", "connectivity"])
 parser.add_argument("--fault_dist", default="sporadic", choices=["sporadic", "clustered"])
-parser.add_argument("--fault_ratio", type=float, default=0.5)       # 10.79%, sa0 : sa1 = 1.75% : 9.04%
+parser.add_argument("--fault_ratio", type=float, default=0.1)       # 10.79%, sa0 : sa1 = 1.75% : 9.04%
 parser.add_argument("--noise_std", type=float, default=0.5)
 parser.add_argument("--fault_start_epoch", type=int, default=5)
 # Benchmarks
@@ -67,9 +67,9 @@ parser.add_argument("--Astrocyte", type=str2bool, default=False)
 parser.add_argument("--Falvolt", type=str2bool, default=False)
 parser.add_argument("--LIFA", type=str2bool, default=False)
 # Proposed
-parser.add_argument("--Frag", type=str2bool, default=False)
-parser.add_argument("--Learnable", type=str2bool, default=False)
-parser.add_argument("--Dynamic", type=str2bool, default=True)
+parser.add_argument("--Frag", type=str2bool, default=False)      # Fragmentation function
+parser.add_argument("--Learnable", type=str2bool, default=False) # Learnable division line
+parser.add_argument("--Dynamic", type=str2bool, default=False)   # Dynamically changing the number of fragments
 # ETC
 parser.add_argument("--gpu_num", type=int, default=0)
 parser.add_argument("--plot", type=bool, default=False)
@@ -151,8 +151,8 @@ train_loader = DataLoader(train_set, batch_size=train_batch_size, shuffle=True, 
 test_loader  = DataLoader(test_set,  batch_size=test_batch_size, shuffle=False, drop_last=True)
 
 # ===== loss/opt/scheduler/encoder =====
-loss_fn = nn.MSELoss()
-# loss_fn = nn.CrossEntropyLoss()
+# loss_fn = nn.MSELoss()
+loss_fn = nn.CrossEntropyLoss()
 
 # ===== VGG configs (CIFAR-friendly) =====
 def get_vgg_cfg(depth):
@@ -188,7 +188,6 @@ class VGG_DNN(nn.Module):
             nn.ReLU(),
             nn.Dropout(p=0.5),
             nn.Linear(512, num_classes, bias=bias),
-            nn.ReLU(),
         )
 
     def _make_layers(self, cfg, in_ch, bias):
@@ -568,21 +567,21 @@ for epoch in range(num_epochs):
             bounder.capture_snapshot(net)
             bounder.activate()
         elif Frag_on:
-            loss_val = fragmentation_loss(output, targets, mode="rmse")
+            loss_val = fragmentation_loss(output, targets, mode="ce")
         elif Learnable_on:
-            loss_val = (fragmentation_loss(output, targets, mode="rmse") + learnable_frags.aux_loss() +
+            loss_val = (fragmentation_loss(output, targets, mode="ce") + learnable_frags.aux_loss() +
                         learnable_frags.sep_loss() + learnable_frags.cross_loss())
         elif Dynamic_on:
-            loss_val = (fragmentation_loss(output, targets, mode="rmse") + dynamic_frags.aux_loss() +
+            loss_val = (fragmentation_loss(output, targets, mode="ce") + dynamic_frags.aux_loss() +
                         dynamic_frags.sep_loss() + dynamic_frags.cross_loss())
         elif Fault_on and Astro_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + astro(epoch)
+            loss_val = loss_fn(output, target_onehot) + astro(epoch)
         elif Fault_on and Falvolt_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + falvolt(epoch)
+            loss_val = loss_fn(output, target_onehot) + falvolt(epoch)
         elif Fault_on and LIFA_on:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6) + lifa(epoch)
+            loss_val = loss_fn(output, target_onehot) + lifa(epoch)
         else:
-            loss_val = torch.sqrt(loss_fn(output, target_onehot) + 1e-6)
+            loss_val = loss_fn(output, target_onehot)
             # loss_val = loss_fn(output, targets)
 
 

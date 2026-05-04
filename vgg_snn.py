@@ -17,11 +17,11 @@ import numpy as np
 import argparse
 import seaborn as sns
 
-from utils import TDBatchNorm, ZBiasAdder  # tdBN
+from utils import TDBatchNorm, ZBiasAdder, FragmentEnergyTracker  # tdBN
 from fault_injection import build_fault_manager, get_fault_map
 from benchmarks import ECOCHead, install_softsnn, install_router_from_mask, autoroute_with_mask, attach_slot_activity_tracker, install_astro_auto, install_falvolt_auto, install_lifa_auto
 from algorithmic_fragmentation import batch_dynamic_fragments, batch_manual_fragments, agg_conf_logits, fragmentation_loss
-from learnable_fragmentation import GlobalMultiLineFrags, DynamicGlobalMultiLineFragsMerge, DynamicGlobalMultiLineFragsMoE
+from learnable_fragmentation import GlobalMultiLineFrags, DynamicGlobalStaticMultiLineFrags, DynamicGlobalMultiLineFragsMerge, DynamicGlobalMultiLineFragsMoE
 from surrogate_encoders import SurrogatePoissonEncoder
 
 dtype = torch.float
@@ -55,10 +55,10 @@ parser.add_argument("--bias_start_epoch", type=float, default=5)
 parser.add_argument("--bias_target_layer", nargs='+', metavar="PATTERN", default=None)  # e.g., ['fc1']
 parser.add_argument("--bias_apply_to_all", type=bool, default=True)
 # Faults
-parser.add_argument("--Fault", type=bool, default=True)
-parser.add_argument("--fault_type", default="connectivity", choices=["stuck", "random", "connectivity"])
+parser.add_argument("--Fault", type=bool, default=False)
+parser.add_argument("--fault_type", default="stuck", choices=["stuck", "random", "connectivity"])
 parser.add_argument("--fault_dist", default="sporadic", choices=["sporadic", "clustered"])
-parser.add_argument("--fault_ratio", type=float, default=0.2)       # 10.79%, sa0 : sa1 = 1.75% : 9.04%
+parser.add_argument("--fault_ratio", type=float, default=0.1)       # 10.79%, sa0 : sa1 = 1.75% : 9.04%
 parser.add_argument("--noise_std", type=float, default=0.5)
 parser.add_argument("--fault_start_epoch", type=int, default=5)
 # Benchmarks
@@ -69,9 +69,9 @@ parser.add_argument("--Astrocyte", type=str2bool, default=False)
 parser.add_argument("--Falvolt", type=str2bool, default=False)
 parser.add_argument("--LIFA", type=str2bool, default=False)
 # Proposed
-parser.add_argument("--Frag", type=str2bool, default=False)
-parser.add_argument("--Learnable", type=str2bool, default=False)
-parser.add_argument("--Dynamic", type=str2bool, default=True)
+parser.add_argument("--Frag", type=str2bool, default=False)      # Fragmentation function
+parser.add_argument("--Learnable", type=str2bool, default=False) # Learnable division line
+parser.add_argument("--Dynamic", type=str2bool, default=False)   # Dynamically changing the number of fragments
 # ETC
 parser.add_argument("--gpu_num", type=int, default=0)
 parser.add_argument("--plot", type=bool, default=False)
@@ -425,6 +425,30 @@ elif Dynamic_on:
         },
     }
 
+    # dynamic_frags = DynamicGlobalStaticMultiLineFrags(
+    #     H=32, W=32,
+    #     candidates=(2, 4, 8),
+    #     init_num_steps=num_steps,
+    #     direction="horizontal",  # 또는 vertical / diag_lr / diag_rl
+    #     gumbel_tau=1.0,
+    #     gumbel_hard=True,
+    #     warmup_iters=500,
+    #     importance_cfg=importance_cfg,
+    #     power_norm=power_cfg,
+    #     hard_forward=True,
+    #     hard_eval=True,
+    #     overlap=True,
+    #     kernel_size=15,
+    #     overlap_iter=3,
+    #     balance_metric="mse",
+    #     balance_weight=0.01,
+    #     line_sep_weight=1e-3,
+    #     line_sep_cos_thr=0.995,
+    #     line_sep_offset_margin=0.03,
+    #     line_cross_weight=1e-3,
+    #     auto_init=True,  # signature 호환용(정적 모듈에서는 사용 안 함)
+    # ).to(device)
+
     dynamic_frags  = DynamicGlobalMultiLineFragsMoE(
         H=32, W=32,
         candidates=(2, 4, 8),
@@ -638,6 +662,8 @@ w_targets = torch.tensor([], dtype=dtype).to(device)
 w_predicted = torch.tensor([], dtype=dtype).to(device)
 
 # ===== testing =====
+# frag_energy = FragmentEnergyTracker(layout="btc")
+
 with torch.no_grad():
     if ZBias_on and bias_adder is not None:
         bias_adder.current_epoch = epoch
@@ -671,6 +697,7 @@ with torch.no_grad():
 
         elif Learnable_on:
             data = learnable_frags(data)  # [B, T, C, H, W]
+            # frag_energy.update(data)
             test_output = []
             for step in range(num_steps):
                 input = data[:, step]
@@ -681,6 +708,7 @@ with torch.no_grad():
 
         elif Dynamic_on:
             data = dynamic_frags(data, output_mode="selected", sample_steps=True)  # [B, Tmax, C, H, W]
+            # frag_energy.update(data)
             num_steps = data.size(1)
             test_output = []
             for step in range(num_steps):
@@ -708,6 +736,7 @@ with torch.no_grad():
 # === After the test loop ===
 print(f"Total correctly classified test set images: {correct}/{total}")
 print(f"Test Set Accuracy: {100 * correct / total:.2f}%")
+# print(frag_energy.format(title=None, joiner=", "))
 
 # Confusion Matrix
 w_targets = w_targets.detach().cpu().numpy()
